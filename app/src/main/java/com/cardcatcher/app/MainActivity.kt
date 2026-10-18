@@ -10,6 +10,7 @@ import com.cardcatcher.app.data.AppDatabase
 import com.cardcatcher.app.data.InventoryRepository
 import com.cardcatcher.app.ui.MainScreen
 import com.cardcatcher.app.ui.MainViewModel
+import com.cardcatcher.app.ui.theme.CardCatcherTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -28,7 +29,9 @@ class MainActivity : ComponentActivity() {
             val vm: MainViewModel = viewModel(
                 factory = MainViewModel.Factory(repository)
             )
-            MainScreen(viewModel = vm)
+            CardCatcherTheme {
+                MainScreen(viewModel = vm)
+            }
         }
     }
 }

@@ -77,6 +77,23 @@ class MainViewModel(
         _message.value = null
     }
 
+    fun deleteTransaction(transactionId: Long) {
+        viewModelScope.launch {
+            repository.deleteTransaction(transactionId)
+        }
+    }
+
+    fun addCatalogProduct(productName: String, marketPriceEur: Double) {
+        if (productName.isBlank() || marketPriceEur < 0.0) {
+            _message.value = "Skontroluj hodnoty formulára"
+            return
+        }
+        viewModelScope.launch {
+            repository.addCatalogProduct(productName.trim(), marketPriceEur)
+            _message.value = "Produkt uložený"
+        }
+    }
+
     class Factory(private val repository: InventoryRepository) : ViewModelProvider.Factory {
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             return MainViewModel(repository) as T
