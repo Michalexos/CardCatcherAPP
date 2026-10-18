@@ -8,6 +8,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.room.Room
 import com.cardcatcher.app.data.AppDatabase
 import com.cardcatcher.app.data.InventoryRepository
+import com.cardcatcher.app.data.MIGRATION_1_2
 import com.cardcatcher.app.ui.MainScreen
 import com.cardcatcher.app.ui.MainViewModel
 import com.cardcatcher.app.ui.theme.CardCatcherTheme
@@ -21,7 +22,9 @@ class MainActivity : ComponentActivity() {
             applicationContext,
             AppDatabase::class.java,
             "cardcatcher.db"
-        ).build()
+        )
+            .addMigrations(MIGRATION_1_2)
+            .build()
 
         val repository = InventoryRepository(database.inventoryDao())
 

@@ -3,7 +3,6 @@ package com.cardcatcher.app.ui
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.cardcatcher.app.data.CatalogProductEntity
 import com.cardcatcher.app.data.InventoryRepository
 import com.cardcatcher.app.data.InventoryTransactionEntity
 import com.cardcatcher.app.data.TransactionType
@@ -28,12 +27,12 @@ class MainViewModel(
     val message: StateFlow<String?> = _message
 
     val state: StateFlow<UiState> = combine(
-        repository.catalog,
-        repository.transactions
-    ) { catalog, transactions ->
+        repository.transactions,
+        repository.knownProducts
+    ) { transactions, knownProducts ->
         UiState(
-            catalog = catalog,
             transactions = transactions,
+            knownProducts = knownProducts,
             positions = InventorySummary.currentPositions(transactions),
             stats = StatsCalculator.build(transactions)
         )
@@ -43,18 +42,13 @@ class MainViewModel(
         initialValue = UiState()
     )
 
-    init {
-        viewModelScope.launch {
-            repository.seedCatalog()
-        }
-    }
-
     fun addTransaction(
         productName: String,
         quantity: Int,
         totalPriceEur: Double,
         date: LocalDate,
-        type: TransactionType
+        type: TransactionType,
+        imageUri: String?
     ) {
         if (productName.isBlank() || quantity <= 0 || totalPriceEur < 0.0) {
             _message.value = "Skontroluj hodnoty formulára"
@@ -62,12 +56,17 @@ class MainViewModel(
         }
 
         viewModelScope.launch {
+            // If no image provided, reuse last known image for this product
+            val resolvedImageUri = imageUri
+                ?: repository.getImageUriForProduct(productName.trim())
+
             repository.addTransaction(
-                productName = productName,
+                productName = productName.trim(),
                 quantity = quantity,
                 totalPriceEur = totalPriceEur,
                 dateEpochDay = date.toEpochDay(),
-                type = type
+                type = type,
+                imageUri = resolvedImageUri
             )
             _message.value = "Transakcia uložená"
         }
@@ -83,17 +82,6 @@ class MainViewModel(
         }
     }
 
-    fun addCatalogProduct(productName: String, marketPriceEur: Double) {
-        if (productName.isBlank() || marketPriceEur < 0.0) {
-            _message.value = "Skontroluj hodnoty formulára"
-            return
-        }
-        viewModelScope.launch {
-            repository.addCatalogProduct(productName.trim(), marketPriceEur)
-            _message.value = "Produkt uložený"
-        }
-    }
-
     class Factory(private val repository: InventoryRepository) : ViewModelProvider.Factory {
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             return MainViewModel(repository) as T
@@ -102,8 +90,8 @@ class MainViewModel(
 }
 
 data class UiState(
-    val catalog: List<CatalogProductEntity> = emptyList(),
     val transactions: List<InventoryTransactionEntity> = emptyList(),
+    val knownProducts: List<String> = emptyList(),
     val positions: List<ProductPosition> = emptyList(),
     val stats: Map<StatsWindow, PeriodStats> = emptyMap()
 )

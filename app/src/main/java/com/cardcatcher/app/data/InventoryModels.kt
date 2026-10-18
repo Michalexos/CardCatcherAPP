@@ -15,11 +15,6 @@ data class InventoryTransactionEntity(
     val quantity: Int,
     val totalPriceEur: Double,
     val dateEpochDay: Long,
-    val type: TransactionType
-)
-
-@Entity(tableName = "catalog")
-data class CatalogProductEntity(
-    @PrimaryKey val name: String,
-    val marketPriceEur: Double
+    val type: TransactionType,
+    val imageUri: String? = null
 )

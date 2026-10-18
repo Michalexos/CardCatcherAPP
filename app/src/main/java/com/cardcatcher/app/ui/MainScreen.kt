@@ -1,10 +1,14 @@
 package com.cardcatcher.app.ui
 
 import android.graphics.BitmapFactory
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,17 +25,19 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.ListAlt
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.ShowChart
-import androidx.compose.material.icons.filled.Storefront
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -92,7 +98,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.cardcatcher.app.data.CatalogProductEntity
+import coil.compose.AsyncImage
 import com.cardcatcher.app.data.InventoryTransactionEntity
 import com.cardcatcher.app.data.TransactionType
 import com.cardcatcher.app.domain.PeriodStats
@@ -126,8 +132,7 @@ private val eurFormatter: NumberFormat = NumberFormat.getCurrencyInstance(slovak
 private enum class MainTab(val label: String, val icon: ImageVector) {
     OVERVIEW("Prehľad", Icons.Default.ShowChart),
     INVENTORY("Sklad", Icons.Default.Inventory2),
-    TRANSACTIONS("Transakcie", Icons.Default.ListAlt),
-    CATALOG("Katalóg", Icons.Default.Storefront)
+    TRANSACTIONS("Transakcie", Icons.Default.ListAlt)
 }
 
 private enum class PricingMode(val label: String) {
@@ -162,7 +167,6 @@ fun MainScreen(viewModel: MainViewModel) {
     if (selectedProductDetail != null) {
         ProductDetailScreen(
             productName = selectedProductDetail.orEmpty(),
-            catalog = state.catalog,
             positions = positionByName,
             transactions = state.transactions,
             onBack = { selectedProductDetail = null },
@@ -220,8 +224,8 @@ fun MainScreen(viewModel: MainViewModel) {
 
                 MainTab.INVENTORY -> InventoryScreen(
                     modifier = Modifier.padding(padding),
-                    catalog = state.catalog,
                     positions = positionByName,
+                    transactions = state.transactions,
                     onOpenDetail = { selectedProductDetail = it }
                 )
 
@@ -230,24 +234,19 @@ fun MainScreen(viewModel: MainViewModel) {
                     transactions = state.transactions,
                     onDelete = viewModel::deleteTransaction
                 )
-
-                MainTab.CATALOG -> CatalogScreen(
-                    modifier = Modifier.padding(padding),
-                    catalog = state.catalog,
-                    onAddProduct = viewModel::addCatalogProduct
-                )
             }
         }
     }
 
     if (openTransactionSheet) {
         AddTransactionSheet(
-            catalog = state.catalog,
+            knownProducts = state.knownProducts,
+            transactions = state.transactions,
             initialProductName = selectedProductDetail,
             initialType = forcedType ?: TransactionType.PURCHASE,
             onDismiss = { openTransactionSheet = false },
-            onSave = { product, quantity, totalPrice, date, type ->
-                viewModel.addTransaction(product, quantity, totalPrice, date, type)
+            onSave = { product, quantity, totalPrice, date, type, imageUri ->
+                viewModel.addTransaction(product, quantity, totalPrice, date, type, imageUri)
                 openTransactionSheet = false
             }
         )
@@ -266,13 +265,32 @@ private fun OverviewScreen(
     val stats = state.stats[selectedWindow] ?: PeriodStats(0.0, 0.0, 0.0, 0, 0)
     val allTime = state.stats[StatsWindow.ALL_TIME] ?: PeriodStats(0.0, 0.0, 0.0, 0, 0)
 
-    val inventoryValue = state.positions.sumOf { position ->
-        val market = state.catalog.firstOrNull { it.name == position.productName }?.marketPriceEur ?: 0.0
-        position.quantityInStock.coerceAtLeast(0) * market
-    }
-    val netProfit = inventoryValue + allTime.revenueEur - allTime.spentEur
+    var showRealizedOnly by rememberSaveable { mutableStateOf(false) }
+
+    // Totálny P&L
+    val netProfit = allTime.revenueEur - allTime.spentEur
     val profitPercent = if (allTime.spentEur > 0.0) (netProfit / allTime.spentEur) * 100.0 else 0.0
     val invested = (stats.spentEur - stats.revenueEur).coerceAtLeast(0.0)
+
+    // Realizovaný zisk = iba z predaných kusov (revenue - priemerná nákupná cena × predané kusy)
+    val realizedProfit = remember(state.transactions, selectedWindow) {
+        computeRealizedProfit(state.transactions, selectedWindow)
+    }
+    val realizedPercent = remember(state.transactions) {
+        val allPurchases = state.transactions.filter { it.type == TransactionType.PURCHASE }
+        val costOfSold = state.transactions.filter { it.type == TransactionType.SALE }.sumOf { saleTx ->
+            val productPurchases = allPurchases.filter { it.productName == saleTx.productName }
+            val totalUnits = productPurchases.sumOf { it.quantity }
+            val totalCost = productPurchases.sumOf { it.totalPriceEur }
+            val avgCost = if (totalUnits > 0) totalCost / totalUnits else 0.0
+            avgCost * saleTx.quantity
+        }
+        if (costOfSold > 0.0) (realizedProfit / costOfSold) * 100.0 else 0.0
+    }
+
+    val displayProfit = if (showRealizedOnly) realizedProfit else netProfit
+    val displayPercent = if (showRealizedOnly) realizedPercent else profitPercent
+    val displayLabel = if (showRealizedOnly) "Zisk z predaných kusov" else "Výsledok obchodovania"
 
     val chartPoints = remember(state.transactions, selectedWindow) {
         buildChartPoints(state.transactions, selectedWindow)
@@ -286,7 +304,31 @@ private fun OverviewScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        item { DashboardHeader() }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                DashboardHeader()
+                // Kruhové tlačidlo — prepínač realizovaný zisk
+                Box(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(CircleShape)
+                        .background(if (showRealizedOnly) Mint else Surface1)
+                        .clickable { showRealizedOnly = !showRealizedOnly },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.ShowChart,
+                        contentDescription = "Prepnúť na realizovaný zisk",
+                        tint = if (showRealizedOnly) Navy else TextMuted,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+            }
+        }
 
         item {
             Card(
@@ -308,15 +350,31 @@ private fun OverviewScreen(
                         modifier = Modifier.padding(20.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text("Hodnota skladu", color = TextMuted, style = MaterialTheme.typography.bodyMedium)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(displayLabel, color = TextMuted, style = MaterialTheme.typography.bodyMedium)
+                            if (showRealizedOnly) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(Mint.copy(alpha = 0.15f))
+                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                ) {
+                                    Text("Predané", color = Mint, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
                         Text(
-                            formatCurrency(inventoryValue),
-                            color = TextMain,
+                            formatCurrency(displayProfit),
+                            color = if (displayProfit >= 0) TextMain else Loss,
                             style = MaterialTheme.typography.headlineLarge
                         )
                         TrendPill(
-                            text = "${formatSigned(netProfit)} (${formatPercent(profitPercent)})",
-                            positive = netProfit >= 0
+                            text = "${formatSigned(displayProfit)} (${formatPercent(displayPercent)})",
+                            positive = displayProfit >= 0
                         )
                         PerformanceChart(points = chartPoints)
                         PeriodSelector(selected = selectedWindow, onSelected = onWindowSelected)
@@ -329,9 +387,9 @@ private fun OverviewScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 StatCard("Investované", formatCurrency(invested), TextMain, Modifier.weight(1f))
                 StatCard(
-                    "Zisk (realizovaný)",
-                    formatCurrency(stats.profitEur),
-                    if (stats.profitEur >= 0) Profit else Loss,
+                    if (showRealizedOnly) "Zisk predaných" else "Zisk (realizovaný)",
+                    formatCurrency(if (showRealizedOnly) realizedProfit else stats.profitEur),
+                    if ((if (showRealizedOnly) realizedProfit else stats.profitEur) >= 0) Profit else Loss,
                     Modifier.weight(1f)
                 )
             }
@@ -481,22 +539,26 @@ private fun PerformanceChart(points: List<Double>) {
 @Composable
 private fun InventoryScreen(
     modifier: Modifier,
-    catalog: List<CatalogProductEntity>,
     positions: Map<String, ProductPosition>,
+    transactions: List<InventoryTransactionEntity>,
     onOpenDetail: (String) -> Unit
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var sortByValue by rememberSaveable { mutableStateOf(true) }
-    var inStockOnly by rememberSaveable { mutableStateOf(true) }
+    var inStockOnly by rememberSaveable { mutableStateOf(false) }
 
-    val rows = remember(catalog, positions, query, sortByValue, inStockOnly) {
-        catalog.map { product ->
-            val quantity = positions[product.name]?.quantityInStock?.coerceAtLeast(0) ?: 0
+    // Build rows from positions (no catalog needed)
+    val rows = remember(positions, transactions, query, sortByValue, inStockOnly) {
+        positions.values.map { position ->
+            val imageUri = transactions
+                .lastOrNull { it.productName == position.productName && it.imageUri != null }
+                ?.imageUri
             InventoryRow(
-                name = product.name,
-                quantity = quantity,
-                value = quantity * product.marketPriceEur,
-                sealed = isSealedName(product.name)
+                name = position.productName,
+                quantity = position.quantityInStock.coerceAtLeast(0),
+                value = position.totalSpentEur - position.totalRevenueEur,
+                sealed = isSealedName(position.productName),
+                imageUri = imageUri
             )
         }
             .filter { it.name.contains(query.trim(), ignoreCase = true) }
@@ -523,7 +585,10 @@ private fun InventoryScreen(
             colors = fieldColors(),
             modifier = Modifier.fillMaxWidth()
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             ToggleChip("Podľa hodnoty", sortByValue) { sortByValue = true }
             ToggleChip("Podľa množstva", !sortByValue) { sortByValue = false }
             ToggleChip("Na sklade", inStockOnly) { inStockOnly = !inStockOnly }
@@ -554,7 +619,7 @@ private fun InventoryScreen(
                 ) {
                     Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Box {
-                            ProductImage(row.name, Modifier.fillMaxWidth().height(110.dp))
+                            ProductImage(row.name, row.imageUri, Modifier.fillMaxWidth().height(110.dp))
                             if (row.sealed) {
                                 Box(
                                     modifier = Modifier
@@ -582,7 +647,7 @@ private fun InventoryScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text("${row.quantity} ks", color = TextMuted, style = MaterialTheme.typography.bodyMedium)
-                            Text(formatCurrency(row.value), color = Mint, fontWeight = FontWeight.Bold)
+                            Text(formatCurrency(row.value.coerceAtLeast(0.0)), color = Mint, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -594,18 +659,20 @@ private fun InventoryScreen(
 @Composable
 private fun ProductDetailScreen(
     productName: String,
-    catalog: List<CatalogProductEntity>,
     positions: Map<String, ProductPosition>,
     transactions: List<InventoryTransactionEntity>,
     onBack: () -> Unit,
     onAddPurchase: () -> Unit
 ) {
-    val marketPrice = catalog.firstOrNull { it.name == productName }?.marketPriceEur ?: 0.0
     val position = positions[productName]
     val quantity = position?.quantityInStock?.coerceAtLeast(0) ?: 0
-    val totalValue = quantity * marketPrice
     val costBasis = position?.totalSpentEur ?: 0.0
-    val profitPercent = if (costBasis > 0.0) ((totalValue - costBasis) / costBasis) * 100.0 else 0.0
+    val revenue = position?.totalRevenueEur ?: 0.0
+    val invested = (costBasis - revenue).coerceAtLeast(0.0)
+
+    val imageUri = transactions
+        .lastOrNull { it.productName == productName && it.imageUri != null }
+        ?.imageUri
 
     val purchaseLots = transactions
         .filter { it.productName == productName && it.type == TransactionType.PURCHASE }
@@ -643,11 +710,10 @@ private fun ProductDetailScreen(
             item {
                 Card(colors = CardDefaults.cardColors(containerColor = Surface1), shape = RoundedCornerShape(24.dp)) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        ProductImage(productName, Modifier.fillMaxWidth().height(170.dp))
+                        ProductImage(productName, imageUri, Modifier.fillMaxWidth().height(170.dp))
                         Text(productName, color = TextMain, style = MaterialTheme.typography.titleLarge)
-                        Text("Celková hodnota", color = TextMuted, style = MaterialTheme.typography.bodyMedium)
-                        Text(formatCurrency(totalValue), color = TextMain, style = MaterialTheme.typography.headlineMedium)
-                        TrendPill(formatPercent(profitPercent), profitPercent >= 0.0)
+                        Text("Investované", color = TextMuted, style = MaterialTheme.typography.bodyMedium)
+                        Text(formatCurrency(invested), color = TextMain, style = MaterialTheme.typography.headlineMedium)
                         HorizontalDivider(color = Surface2)
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Column {
@@ -672,7 +738,6 @@ private fun ProductDetailScreen(
             items(purchaseLots.size) { index ->
                 val lot = purchaseLots[index]
                 val unitPrice = if (lot.quantity > 0) lot.totalPriceEur / lot.quantity else 0.0
-                val change = if (unitPrice > 0.0) ((marketPrice - unitPrice) / unitPrice) * 100.0 else 0.0
                 Card(colors = CardDefaults.cardColors(containerColor = Surface1), shape = RoundedCornerShape(16.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(14.dp),
@@ -688,8 +753,8 @@ private fun ProductDetailScreen(
                             Text(formatDate(lot.dateEpochDay), color = TextMuted, style = MaterialTheme.typography.bodyMedium)
                         }
                         Text(
-                            formatPercent(change),
-                            color = if (change >= 0.0) Profit else Loss,
+                            formatCurrency(lot.totalPriceEur),
+                            color = Mint,
                             fontWeight = FontWeight.SemiBold
                         )
                     }
@@ -736,7 +801,16 @@ private fun TransactionsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        // Product thumbnail
+                        ProductImage(
+                            name = tx.productName,
+                            imageUri = tx.imageUri,
+                            modifier = Modifier.size(48.dp)
+                        )
+                        Column(
+                            modifier = Modifier.weight(1f).padding(start = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Box(
                                     modifier = Modifier
@@ -796,161 +870,66 @@ private fun TransactionsScreen(
     }
 }
 
-// ---------------------------------------------------------------- katalóg
-
-@Composable
-private fun CatalogScreen(
-    modifier: Modifier,
-    catalog: List<CatalogProductEntity>,
-    onAddProduct: (String, Double) -> Unit
-) {
-    var openDialog by rememberSaveable { mutableStateOf(false) }
-
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .background(Navy)
-            .padding(horizontal = 16.dp)
-            .padding(top = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            ScreenTitle("Katalóg", "${catalog.size} produktov")
-            Button(
-                onClick = { openDialog = true },
-                shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Pink, contentColor = Navy)
-            ) { Text("Pridať", fontWeight = FontWeight.Bold) }
-        }
-
-        LazyColumn(
-            contentPadding = PaddingValues(bottom = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            items(catalog.size, key = { catalog[it].name }) { index ->
-                val product = catalog[index]
-                Card(colors = CardDefaults.cardColors(containerColor = Surface1), shape = RoundedCornerShape(18.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        ProductImage(product.name, Modifier.size(56.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                product.name,
-                                color = TextMain,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text("Trhová cena", color = TextMuted, style = MaterialTheme.typography.bodySmall)
-                        }
-                        Text(formatCurrency(product.marketPriceEur), color = Mint, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
-    }
-
-    if (openDialog) {
-        AddCatalogDialog(
-            onDismiss = { openDialog = false },
-            onConfirm = { name, price ->
-                onAddProduct(name, price)
-                openDialog = false
-            }
-        )
-    }
-}
-
-@Composable
-private fun AddCatalogDialog(onDismiss: () -> Unit, onConfirm: (String, Double) -> Unit) {
-    var name by rememberSaveable { mutableStateOf("") }
-    var price by rememberSaveable { mutableStateOf("") }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = Surface1,
-        titleContentColor = TextMain,
-        textContentColor = TextMain,
-        title = { Text("Nový produkt") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
-                    label = { Text("Názov produktu") },
-                    shape = RoundedCornerShape(14.dp),
-                    colors = fieldColors(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = price,
-                    onValueChange = { price = normalizeDecimalInput(it) },
-                    label = { Text("Trhová cena (€)") },
-                    shape = RoundedCornerShape(14.dp),
-                    colors = fieldColors(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { onConfirm(name, parseDecimal(price)) }, colors = mintText()) { Text("Uložiť") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss, colors = mintText()) { Text("Zrušiť") }
-        }
-    )
-}
-
 // ---------------------------------------------------------------- nová transakcia
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddTransactionSheet(
-    catalog: List<CatalogProductEntity>,
+    knownProducts: List<String>,
+    transactions: List<InventoryTransactionEntity>,
     initialProductName: String?,
     initialType: TransactionType,
     onDismiss: () -> Unit,
-    onSave: (String, Int, Double, LocalDate, TransactionType) -> Unit
+    onSave: (String, Int, Double, LocalDate, TransactionType, String?) -> Unit
 ) {
-    var selectedProduct by rememberSaveable { mutableStateOf(initialProductName.orEmpty()) }
-    var productSearch by rememberSaveable { mutableStateOf("") }
-    var expanded by rememberSaveable { mutableStateOf(false) }
+    var productName by rememberSaveable { mutableStateOf(initialProductName.orEmpty()) }
+    var showProductPicker by rememberSaveable { mutableStateOf(false) }
     var quantity by rememberSaveable { mutableStateOf("1") }
     var priceInput by rememberSaveable { mutableStateOf("") }
     var type by rememberSaveable { mutableStateOf(initialType) }
     var pricingMode by rememberSaveable { mutableStateOf(PricingMode.PER_PIECE) }
     var showDatePicker by rememberSaveable { mutableStateOf(false) }
     var selectedDate by rememberSaveable { mutableStateOf(LocalDate.now()) }
+    var pickedImageUri by rememberSaveable { mutableStateOf<String?>(null) }
+    val sheetState = androidx.compose.material3.rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    val filteredProducts = remember(catalog, productSearch) {
-        catalog.filter { it.name.contains(productSearch.trim(), ignoreCase = true) }
+    // Auto-fill image from last transaction with same product name
+    val autoImageUri = remember(productName, transactions) {
+        transactions.lastOrNull { it.productName == productName.trim() && it.imageUri != null }?.imageUri
     }
+    val displayImageUri = pickedImageUri ?: autoImageUri
+
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        pickedImageUri = uri?.toString()
+    }
+
     val qty = quantity.toIntOrNull() ?: 0
     val totalPrice = remember(priceInput, quantity, pricingMode) {
         val parsed = parseDecimal(priceInput)
         if (pricingMode == PricingMode.PER_PIECE) parsed * qty else parsed
     }
-    val canSave = selectedProduct.isNotBlank() && qty > 0 && totalPrice > 0.0
+    val canSave = productName.isNotBlank() && qty > 0 && totalPrice > 0.0
 
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Surface1) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = Surface1
+    ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
                 .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Text("Nová transakcia", color = TextMain, style = MaterialTheme.typography.titleLarge)
 
+            // Nákup / Predaj
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 listOf(TransactionType.PURCHASE to "Nákup", TransactionType.SALE to "Predaj")
                     .forEachIndexed { index, item ->
@@ -964,54 +943,99 @@ private fun AddTransactionSheet(
                     }
             }
 
+            // Obrázok produktu
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(140.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(NavyDeep)
+                    .clickable { imagePicker.launch("image/*") },
+                contentAlignment = Alignment.Center
+            ) {
+                if (displayImageUri != null) {
+                    AsyncImage(
+                        model = Uri.parse(displayImageUri),
+                        contentDescription = "Obrázok produktu",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize().padding(8.dp)
+                    )
+                    // Edit overlay
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(8.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(Surface1.copy(alpha = 0.85f))
+                            .padding(8.dp)
+                    ) {
+                        Icon(Icons.Default.AddPhotoAlternate, contentDescription = "Zmeniť obrázok", tint = Mint, modifier = Modifier.size(20.dp))
+                    }
+                } else {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Icon(Icons.Default.AddPhotoAlternate, contentDescription = null, tint = TextMuted, modifier = Modifier.size(36.dp))
+                        Text("Pridať obrázok produktu", color = TextMuted, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+            }
+
+            // Textové pole pre názov
             OutlinedTextField(
-                value = productSearch,
-                onValueChange = { productSearch = it },
-                placeholder = { Text("Hľadať produkt") },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                value = productName,
+                onValueChange = {
+                    productName = it
+                    // clear picked image if user types new product name
+                    if (it != initialProductName) pickedImageUri = null
+                },
+                label = { Text("Názov produktu") },
                 singleLine = true,
                 shape = RoundedCornerShape(14.dp),
                 colors = fieldColors(),
                 modifier = Modifier.fillMaxWidth()
             )
 
-            Box {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Navy)
-                        .clickable { expanded = true }
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        if (selectedProduct.isBlank()) "Vyber produkt" else selectedProduct,
-                        color = if (selectedProduct.isBlank()) TextMuted else TextMain,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Text("▾", color = Mint)
-                }
-                DropdownMenu(
-                    expanded = expanded,
-                    onDismissRequest = { expanded = false },
-                    modifier = Modifier.background(Surface2)
-                ) {
-                    filteredProducts.forEach { product ->
-                        DropdownMenuItem(
-                            text = { Text(product.name, color = TextMain) },
-                            onClick = {
-                                selectedProduct = product.name
-                                expanded = false
-                            }
+            // Výber existujúceho produktu (ak existujú)
+            if (knownProducts.isNotEmpty()) {
+                Box {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Navy)
+                            .clickable { showProductPicker = true }
+                            .padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Vybrať existujúci produkt",
+                            color = TextMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
                         )
+                        Text("▾", color = Mint)
+                    }
+                    DropdownMenu(
+                        expanded = showProductPicker,
+                        onDismissRequest = { showProductPicker = false },
+                        modifier = Modifier.background(Surface2)
+                    ) {
+                        knownProducts.forEach { name ->
+                            DropdownMenuItem(
+                                text = { Text(name, color = TextMain) },
+                                onClick = {
+                                    productName = name
+                                    pickedImageUri = null // reset so autoImage kicks in
+                                    showProductPicker = false
+                                }
+                            )
+                        }
                     }
                 }
             }
 
+            // Množstvo
             OutlinedTextField(
                 value = quantity,
                 onValueChange = { quantity = it.filter(Char::isDigit) },
@@ -1022,6 +1046,7 @@ private fun AddTransactionSheet(
                 modifier = Modifier.fillMaxWidth()
             )
 
+            // Cena za kus / Celková cena
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 PricingMode.entries.forEachIndexed { index, mode ->
                     SegmentedButton(
@@ -1046,6 +1071,7 @@ private fun AddTransactionSheet(
                 modifier = Modifier.fillMaxWidth()
             )
 
+            // Dátum
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1063,6 +1089,7 @@ private fun AddTransactionSheet(
                 )
             }
 
+            // Výsledná suma
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -1075,7 +1102,9 @@ private fun AddTransactionSheet(
             PrimaryButton(
                 text = "Uložiť transakciu",
                 enabled = canSave,
-                onClick = { onSave(selectedProduct, qty, totalPrice, selectedDate, type) }
+                onClick = {
+                    onSave(productName.trim(), qty, totalPrice, selectedDate, type, pickedImageUri)
+                }
             )
         }
     }
@@ -1180,23 +1209,35 @@ private fun segmentedColors() = SegmentedButtonDefaults.colors(
 private fun mintText() = ButtonDefaults.textButtonColors(contentColor = Mint)
 
 @Composable
-private fun ProductImage(name: String, modifier: Modifier = Modifier) {
-    val painter = rememberAssetPainter("design/products/${slugify(name)}.png")
+private fun ProductImage(name: String, imageUri: String?, modifier: Modifier = Modifier) {
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(14.dp))
             .background(NavyDeep),
         contentAlignment = Alignment.Center
     ) {
-        if (painter != null) {
-            Image(
-                painter = painter,
-                contentDescription = name,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize().padding(6.dp)
-            )
-        } else {
-            Icon(Icons.Default.Inventory2, contentDescription = null, tint = TextMuted)
+        when {
+            imageUri != null -> {
+                AsyncImage(
+                    model = Uri.parse(imageUri),
+                    contentDescription = name,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize().padding(6.dp)
+                )
+            }
+            else -> {
+                val painter = rememberAssetPainter("design/products/${slugify(name)}.png")
+                if (painter != null) {
+                    Image(
+                        painter = painter,
+                        contentDescription = name,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize().padding(6.dp)
+                    )
+                } else {
+                    Icon(Icons.Default.Inventory2, contentDescription = null, tint = TextMuted)
+                }
+            }
         }
     }
 }
@@ -1221,7 +1262,8 @@ private data class InventoryRow(
     val name: String,
     val quantity: Int,
     val value: Double,
-    val sealed: Boolean
+    val sealed: Boolean,
+    val imageUri: String?
 )
 
 private fun windowLabel(window: StatsWindow): String = when (window) {
@@ -1266,11 +1308,43 @@ private fun buildChartPoints(transactions: List<InventoryTransactionEntity>, win
     if (dates.isEmpty()) return listOf(0.0, 0.0)
 
     var cumulative = 0.0
-    return dates.map { date ->
+    val points = dates.map { date ->
         cumulative += scoped[date].orEmpty().sumOf { tx ->
             if (tx.type == TransactionType.SALE) tx.totalPriceEur else -tx.totalPriceEur
         }
         cumulative
+    }
+    // Graf potrebuje aspoň 2 body — ak je len 1 dátum, pridáme štartovací bod 0
+    return if (points.size < 2) listOf(0.0) + points else points
+}
+
+private fun computeRealizedProfit(
+    transactions: List<InventoryTransactionEntity>,
+    window: StatsWindow
+): Double {
+    val today = LocalDate.now()
+    val startDate: LocalDate? = when (window) {
+        StatsWindow.TODAY -> today
+        StatsWindow.WEEK -> today.with(TemporalAdjusters.previousOrSame(java.time.DayOfWeek.MONDAY))
+        StatsWindow.MONTH -> today.withDayOfMonth(1)
+        StatsWindow.THREE_MONTHS -> today.minusMonths(2).withDayOfMonth(1)
+        StatsWindow.YEAR -> today.withDayOfYear(1)
+        StatsWindow.ALL_TIME -> null
+    }
+
+    val allPurchases = transactions.filter { it.type == TransactionType.PURCHASE }
+    val periodSales = transactions.filter {
+        it.type == TransactionType.SALE &&
+        (startDate == null || !LocalDate.ofEpochDay(it.dateEpochDay).isBefore(startDate))
+    }
+
+    // Pre každý predaj: odpočítaj priemernú nákupnú cenu × predané kusy
+    return periodSales.sumOf { saleTx ->
+        val productPurchases = allPurchases.filter { it.productName == saleTx.productName }
+        val totalUnits = productPurchases.sumOf { it.quantity }
+        val totalCost = productPurchases.sumOf { it.totalPriceEur }
+        val avgCost = if (totalUnits > 0) totalCost / totalUnits else 0.0
+        saleTx.totalPriceEur - (avgCost * saleTx.quantity)
     }
 }
 
