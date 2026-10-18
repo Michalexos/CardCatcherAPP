@@ -34,4 +34,17 @@ class InventoryRepository(private val dao: InventoryDao) {
             )
         )
     }
+
+    suspend fun deleteTransaction(transactionId: Long) {
+        dao.deleteTransaction(transactionId)
+    }
+
+    suspend fun addCatalogProduct(productName: String, marketPriceEur: Double) {
+        dao.upsertCatalogProduct(
+            CatalogProductEntity(
+                name = productName,
+                marketPriceEur = marketPriceEur
+            )
+        )
+    }
 }
